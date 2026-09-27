@@ -1,8 +1,9 @@
 # Swept Volume Neural Network Estimation (GPU Architecture Analysis - 591)
 
-**Name:** [Your Name]
-**Course Number:** 591
-**Assignment Choice:** GPU: Network Architecture Analysis
+**Carly Salazar**
+
+- **Course Number:** 591
+- **Assignment Choice:** GPU: Network Architecture Analysis
 
 **Python and PyTorch versions used:**
 - Python 3.10+
