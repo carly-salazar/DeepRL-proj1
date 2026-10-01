@@ -7,7 +7,7 @@ env.reset()
 env.close()
 print("CartPole OK")
 # Box2D
-env = gym.make("LunarLander-v3")fi
+env = gym.make("LunarLander-v3")
 env.reset()
 env.close()
 print("LunarLander OK")
