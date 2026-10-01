@@ -3,14 +3,15 @@ import copy
 import json
 import os
 import time
+import csv
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import matplotlib.pyplot as plt
 from torch.utils.data import TensorDataset, DataLoader
 
 
-# Class name and init parameters match required specifications.
 class NeuralNetwork(nn.Module):
     def __init__(self, in_dimension, out_dimension, hidden_layers, neurons_per_hidden_layer):
         super(NeuralNetwork, self).__init__()
@@ -19,11 +20,9 @@ class NeuralNetwork(nn.Module):
 
         for _ in range(hidden_layers):
             linear = nn.Linear(current_dim, neurons_per_hidden_layer)
-            # Initialize linear-layer weights with xavier_uniform_ and biases with zeros_[cite: 1].
             nn.init.xavier_uniform_(linear.weight)
             nn.init.zeros_(linear.bias)
             layers.append(linear)
-            # torch.nn.ReLU() activation after every layer except the last[cite: 1].
             layers.append(nn.ReLU())
             current_dim = neurons_per_hidden_layer
 
@@ -39,7 +38,6 @@ class NeuralNetwork(nn.Module):
 
 
 def set_seed(seed):
-    # Set the seed before constructing and initializing the network for reproducible replicates[cite: 1].
     torch.manual_seed(seed)
     np.random.seed(seed)
     if torch.cuda.is_available():
@@ -51,24 +49,16 @@ def get_normalization_stats(data):
 
 
 def normalize(data, mean, std):
-    # Transform feature as (x - mu) / sigma[cite: 1].
-    # Add a small epsilon to prevent division by zero in case of constant features
     return (data - mean) / (std + 1e-8)
 
 
-def load_and_prep_data(data_path, train_size, device):
+def load_and_prep_data(data_path, device):
     data = dict(np.load(data_path))
     tensors = {k: torch.tensor(v, dtype=torch.float32).to(device) for k, v in data.items()}
 
-    # Subset training data based on train_size parameter
-    tensors['training_features'] = tensors['training_features'][:train_size]
-    tensors['training_labels'] = tensors['training_labels'][:train_size]
-
-    # Compute normalization statistics strictly from the training examples used[cite: 1].
     feat_mu, feat_std = get_normalization_stats(tensors['training_features'])
     label_mu, label_std = get_normalization_stats(tensors['training_labels'])
 
-    # The evaluation and testing sets must be transformed using mean/std from training data[cite: 1].
     norm_data = {}
     for split in ['training', 'evaluation', 'testing']:
         norm_data[f'{split}_features'] = normalize(tensors[f'{split}_features'], feat_mu, feat_std)
@@ -77,21 +67,15 @@ def load_and_prep_data(data_path, train_size, device):
     return norm_data, label_mu, label_std, feat_mu, feat_std
 
 
-def train_and_evaluate(args):
+def train_single_run(args, norm_data, label_mu, label_std, feat_mu, feat_std):
     set_seed(args.seed)
     device = torch.device(args.device)
-
-    print(f"Loading data from {args.data_path}...")
-    norm_data, label_mu, label_std, feat_mu, feat_std = load_and_prep_data(args.data_path, args.train_size, device)
 
     train_dataset = TensorDataset(norm_data['training_features'], norm_data['training_labels'])
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
 
     model = NeuralNetwork(14, 1, args.hidden_layers, args.neurons).to(device)
-
-    # Use torch.optim.Adam as the optimizer, with no weight decay[cite: 1].
     optimizer = optim.Adam(model.parameters(), lr=args.lr)
-    # Use torch.nn.MSELoss() on the normalized labels as the training loss[cite: 1].
     criterion = nn.MSELoss()
 
     best_eval_rmse = float('inf')
@@ -100,7 +84,6 @@ def train_and_evaluate(args):
     history = {'train_loss': [], 'eval_rmse': []}
 
     if args.device == 'cuda':
-        # call torch.cuda.synchronize() immediately before starting timer[cite: 1].
         torch.cuda.synchronize()
     start_time = time.time()
 
@@ -119,11 +102,9 @@ def train_and_evaluate(args):
         epoch_train_loss /= len(train_dataset)
         history['train_loss'].append(epoch_train_loss)
 
-        # Evaluation phase
         model.eval()
         with torch.no_grad():
             eval_preds_norm = model(norm_data['evaluation_features'])
-            # Convert predictions back to liters and report performance in the original units[cite: 1].
             eval_preds = eval_preds_norm * label_std + label_mu
             eval_labels = norm_data['evaluation_labels'] * label_std + label_mu
 
@@ -131,36 +112,25 @@ def train_and_evaluate(args):
             eval_rmse = np.sqrt(eval_mse)
             history['eval_rmse'].append(eval_rmse)
 
-            # Retain the model state from the epoch with the lowest evaluation error[cite: 1].
             if eval_rmse < best_eval_rmse:
                 best_eval_rmse = eval_rmse
                 best_epoch = epoch
                 best_model_state = copy.deepcopy(model.state_dict())
 
-        if epoch % 100 == 0 or epoch == args.epochs - 1:
-            print(f"Epoch {epoch} | Train Loss (Norm): {epoch_train_loss:.4f} | Eval RMSE (Liters): {eval_rmse:.4f}")
-
     if args.device == 'cuda':
-        # call torch.cuda.synchronize() immediately before stopping timer[cite: 1].
         torch.cuda.synchronize()
     training_time = time.time() - start_time
 
-    print(
-        f"\nTraining complete. Best Eval RMSE: {best_eval_rmse:.4f} at epoch {best_epoch}. Time: {training_time:.2f}s")
-
-    # Save artifacts uniquely identifying the run configuration and seed[cite: 1].
-    run_id = f"hl{args.hidden_layers}_n{args.neurons}_lr{args.lr}_bs{args.batch_size}_sz{args.train_size}_s{args.seed}"
+    run_id = f"hl{args.hidden_layers}_n{args.neurons}_s{args.seed}"
     os.makedirs(args.out_dir, exist_ok=True)
 
     results = {
-        "config": vars(args),
+        "hidden_layers": args.hidden_layers,
+        "neurons": args.neurons,
+        "seed": args.seed,
         "best_epoch": best_epoch,
         "best_eval_rmse": best_eval_rmse,
-        "training_time": training_time,
-        "normalization_stats": {
-            "label_mu": label_mu.item(), "label_std": label_std.item(),
-            "feat_mu": feat_mu.tolist(), "feat_std": feat_std.tolist()
-        }
+        "training_time": training_time
     }
 
     with open(os.path.join(args.out_dir, f"{run_id}_results.json"), 'w') as f:
@@ -170,43 +140,127 @@ def train_and_evaluate(args):
              train_loss=history['train_loss'], eval_rmse=history['eval_rmse'])
 
     torch.save(best_model_state, os.path.join(args.out_dir, f"{run_id}_model.pt"))
-    print(f"Saved run artifacts to {args.out_dir}/")
 
-    # Quick-test mode must not report performance on the held-out testing set[cite: 1].
-    if not args.quick_test:
-        model.load_state_dict(best_model_state)
-        model.eval()
-        with torch.no_grad():
-            test_preds_norm = model(norm_data['testing_features'])
-            test_preds = test_preds_norm * label_std + label_mu
-            test_labels = norm_data['testing_labels'] * label_std + label_mu
-            test_mse = nn.functional.mse_loss(test_preds, test_labels).item()
-            test_rmse = np.sqrt(test_mse)
-            print(f"Final Held-Out Test MSE: {test_mse:.4f} | Test RMSE: {test_rmse:.4f}")
+    return results, history['eval_rmse']
+
+
+def generate_plots(all_histories, epochs, out_dir):
+    os.makedirs(os.path.join(out_dir, 'plots'), exist_ok=True)
+    epoch_axis = np.arange(epochs)
+
+    # Plot 1: Effect of Network Depth (Fix neurons=64, Vary hidden_layers)
+    plt.figure(figsize=(10, 6))
+    for hl in [1, 2, 3]:
+        key = f"hl{hl}_n64"
+        if key in all_histories:
+            data = np.array(all_histories[key])  # Shape: (5_seeds, epochs)
+            mean_rmse = np.mean(data, axis=0)
+            std_rmse = np.std(data, axis=0)
+
+            plt.plot(epoch_axis, mean_rmse, label=f'{hl} Hidden Layers')
+            plt.fill_between(epoch_axis, mean_rmse - std_rmse, mean_rmse + std_rmse, alpha=0.2)
+
+    plt.title('Effect of Network Depth on Evaluation RMSE (64 Neurons/Layer)')
+    plt.xlabel('Epoch')
+    plt.ylabel('Evaluation RMSE (Liters)')
+    plt.legend()
+    plt.grid(True)
+    plt.savefig(os.path.join(out_dir, 'plots', 'depth_effect_rmse.png'))
+    plt.close()
+
+    # Plot 2: Effect of Network Width (Fix hidden_layers=2, Vary neurons)
+    plt.figure(figsize=(10, 6))
+    for n in [32, 64, 128, 256]:
+        key = f"hl2_n{n}"
+        if key in all_histories:
+            data = np.array(all_histories[key])
+            mean_rmse = np.mean(data, axis=0)
+            std_rmse = np.std(data, axis=0)
+
+            plt.plot(epoch_axis, mean_rmse, label=f'{n} Neurons/Layer')
+            plt.fill_between(epoch_axis, mean_rmse - std_rmse, mean_rmse + std_rmse, alpha=0.2)
+
+    plt.title('Effect of Network Width on Evaluation RMSE (2 Hidden Layers)')
+    plt.xlabel('Epoch')
+    plt.ylabel('Evaluation RMSE (Liters)')
+    plt.legend()
+    plt.grid(True)
+    plt.savefig(os.path.join(out_dir, 'plots', 'width_effect_rmse.png'))
+    plt.close()
+
+
+def run_gpu_sweep(args):
+    device = torch.device(args.device)
+    norm_data, label_mu, label_std, feat_mu, feat_std = load_and_prep_data(args.data_path, device)
+
+    hidden_layers_list = [1, 2, 3]
+    neurons_list = [32, 64, 128, 256]
+    seeds = [0, 1, 2, 3, 4]
+
+    all_results = []
+    all_histories = {}
+
+    total_runs = len(hidden_layers_list) * len(neurons_list) * len(seeds)
+    current_run = 0
+
+    print(f"Starting GPU Architecture Sweep: {total_runs} total runs.")
+
+    for hl in hidden_layers_list:
+        for n in neurons_list:
+            config_key = f"hl{hl}_n{n}"
+            all_histories[config_key] = []
+
+            for seed in seeds:
+                current_run += 1
+                print(f"[{current_run}/{total_runs}] Running HL: {hl}, Neurons: {n}, Seed: {seed}...")
+
+                # Overwrite args for the specific run
+                args.hidden_layers = hl
+                args.neurons = n
+                args.seed = seed
+
+                run_stats, eval_rmse_history = train_single_run(args, norm_data, label_mu, label_std, feat_mu, feat_std)
+                all_results.append(run_stats)
+                all_histories[config_key].append(eval_rmse_history)
+
+    # Save aggregated_results.csv
+    csv_path = os.path.join(args.out_dir, 'aggregated_results.csv')
+    with open(csv_path, 'w', newline='') as csvfile:
+        fieldnames = ['hidden_layers', 'neurons', 'seed', 'best_epoch', 'best_eval_rmse', 'training_time']
+        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+        writer.writeheader()
+        for res in all_results:
+            writer.writerow(res)
+
+    print(f"\nSweep complete. Aggregated results saved to {csv_path}")
+
+    print("Generating plots summarizing the 5 replicates...")
+    generate_plots(all_histories, args.epochs, args.out_dir)
+    print(f"Plots saved to {args.out_dir}/plots/")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Swept Volume Neural Network Trainer")
-    # Command-line arguments specifying training-data size, learning rate, architecture, batch size, replicate seed, epochs, and device[cite: 1].
     parser.add_argument("--data-path", type=str, default="swept_volume_data.npz")
-    parser.add_argument("--train-size", type=int, default=100000)
-    parser.add_argument("--lr", type=float, default=1e-3)
-    parser.add_argument("--hidden-layers", type=int, default=2)
-    parser.add_argument("--neurons", type=int, default=64)
-    parser.add_argument("--batch-size", type=int, default=10000)
-    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--lr", type=float, default=1e-3)  # Fixed at 1e-3 for GPU task
+    parser.add_argument("--batch-size", type=int, default=10000)  # Fixed at 10000 for GPU task
     parser.add_argument("--epochs", type=int, default=1000)
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--out-dir", type=str, default="runs")
-    parser.add_argument("--quick-test", action="store_true",
-                        help="Run short training on small subset to verify pipeline")
+    parser.add_argument("--sweep", action="store_true", help="Run the full 60-configuration GPU sweep and plot results")
+
+    # Required for single-run compatibility per assignment specs
+    parser.add_argument("--hidden-layers", type=int, default=2)
+    parser.add_argument("--neurons", type=int, default=64)
+    parser.add_argument("--seed", type=int, default=0)
 
     args = parser.parse_args()
 
-    if args.quick_test:
-        print("Running in quick-test mode...")
-        args.train_size = 1000
-        args.epochs = 5
-        args.batch_size = 100
-
-    train_and_evaluate(args)
+    if args.sweep:
+        run_gpu_sweep(args)
+    else:
+        # Code block to handle the mandatory individual run functionality...
+        device = torch.device(args.device)
+        norm_data, label_mu, label_std, feat_mu, feat_std = load_and_prep_data(args.data_path, device)
+        train_single_run(args, norm_data, label_mu, label_std, feat_mu, feat_std)
+        print("Single run complete.")
