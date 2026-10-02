@@ -105,8 +105,7 @@ def train_single_run(args, norm_data, label_mu, label_std, feat_mu, feat_std):
             optimizer.zero_grad()
             outputs = model(batch_features)
 
-            # FIX: Squeeze outputs to prevent broadcasting mismatch [batch_size, 1] vs [batch_size]
-            loss = criterion(outputs.squeeze(), batch_labels)
+            loss = criterion(outputs, batch_labels.view_as(outputs))
 
             loss.backward()
             optimizer.step()
@@ -128,7 +127,7 @@ def train_single_run(args, norm_data, label_mu, label_std, feat_mu, feat_std):
                 eval_preds_list.append(preds.cpu())  # Move back to CPU for metric calculation
                 eval_labels_list.append(batch_labels)  # Already on CPU
 
-            eval_preds_norm = torch.cat(eval_preds_list).squeeze()
+            eval_preds_norm = torch.cat(eval_preds_list)
             eval_labels_norm = torch.cat(eval_labels_list)
 
             # Unnormalize
@@ -136,7 +135,7 @@ def train_single_run(args, norm_data, label_mu, label_std, feat_mu, feat_std):
             eval_labels = eval_labels_norm * label_std + label_mu
 
             # Calculate metrics
-            eval_mse = nn.functional.mse_loss(eval_preds, eval_labels).item()
+            eval_mse = nn.functional.mse_loss(eval_preds, eval_labels.view_as(eval_preds)).item()
             eval_rmse = np.sqrt(eval_mse)
             history['eval_rmse'].append(eval_rmse)
 
