@@ -54,7 +54,9 @@ def normalize(data, mean, std):
 
 def load_and_prep_data(data_path, device):
     data = dict(np.load(data_path))
-    tensors = {k: torch.tensor(v, dtype=torch.float32).to(device) for k, v in data.items()}
+
+    # FIX: Load to CPU first to avoid VRAM overload. We will move to device in the dataloader loop.
+    tensors = {k: torch.tensor(v, dtype=torch.float32) for k, v in data.items()}
 
     feat_mu, feat_std = get_normalization_stats(tensors['training_features'])
     label_mu, label_std = get_normalization_stats(tensors['training_labels'])
@@ -71,8 +73,13 @@ def train_single_run(args, norm_data, label_mu, label_std, feat_mu, feat_std):
     set_seed(args.seed)
     device = torch.device(args.device)
 
+    # Set up Training DataLoader
     train_dataset = TensorDataset(norm_data['training_features'], norm_data['training_labels'])
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
+
+    # FIX: Set up Evaluation DataLoader to prevent OOM during validation
+    eval_dataset = TensorDataset(norm_data['evaluation_features'], norm_data['evaluation_labels'])
+    eval_loader = DataLoader(eval_dataset, batch_size=args.batch_size, shuffle=False)
 
     model = NeuralNetwork(14, 1, args.hidden_layers, args.neurons).to(device)
     optimizer = optim.Adam(model.parameters(), lr=args.lr)
@@ -92,9 +99,15 @@ def train_single_run(args, norm_data, label_mu, label_std, feat_mu, feat_std):
         epoch_train_loss = 0.0
 
         for batch_features, batch_labels in train_loader:
+            # FIX: Move data to GPU here
+            batch_features, batch_labels = batch_features.to(device), batch_labels.to(device)
+
             optimizer.zero_grad()
             outputs = model(batch_features)
-            loss = criterion(outputs, batch_labels)
+
+            # FIX: Squeeze outputs to prevent broadcasting mismatch [batch_size, 1] vs [batch_size]
+            loss = criterion(outputs.squeeze(), batch_labels)
+
             loss.backward()
             optimizer.step()
             epoch_train_loss += loss.item() * batch_features.size(0)
@@ -103,11 +116,26 @@ def train_single_run(args, norm_data, label_mu, label_std, feat_mu, feat_std):
         history['train_loss'].append(epoch_train_loss)
 
         model.eval()
-        with torch.no_grad():
-            eval_preds_norm = model(norm_data['evaluation_features'])
-            eval_preds = eval_preds_norm * label_std + label_mu
-            eval_labels = norm_data['evaluation_labels'] * label_std + label_mu
+        eval_preds_list = []
+        eval_labels_list = []
 
+        with torch.no_grad():
+            # FIX: Evaluate in batches to prevent VRAM crash
+            for batch_features, batch_labels in eval_loader:
+                batch_features = batch_features.to(device)
+
+                preds = model(batch_features)
+                eval_preds_list.append(preds.cpu())  # Move back to CPU for metric calculation
+                eval_labels_list.append(batch_labels)  # Already on CPU
+
+            eval_preds_norm = torch.cat(eval_preds_list).squeeze()
+            eval_labels_norm = torch.cat(eval_labels_list)
+
+            # Unnormalize
+            eval_preds = eval_preds_norm * label_std + label_mu
+            eval_labels = eval_labels_norm * label_std + label_mu
+
+            # Calculate metrics
             eval_mse = nn.functional.mse_loss(eval_preds, eval_labels).item()
             eval_rmse = np.sqrt(eval_mse)
             history['eval_rmse'].append(eval_rmse)
@@ -115,7 +143,8 @@ def train_single_run(args, norm_data, label_mu, label_std, feat_mu, feat_std):
             if eval_rmse < best_eval_rmse:
                 best_eval_rmse = eval_rmse
                 best_epoch = epoch
-                best_model_state = copy.deepcopy(model.state_dict())
+                # FIX: Pull weights to CPU before saving to prevent VRAM fragmentation/leaks
+                best_model_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
 
     if args.device == 'cuda':
         torch.cuda.synchronize()
@@ -129,7 +158,7 @@ def train_single_run(args, norm_data, label_mu, label_std, feat_mu, feat_std):
         "neurons": args.neurons,
         "seed": args.seed,
         "best_epoch": best_epoch,
-        "best_eval_rmse": best_eval_rmse,
+        "best_eval_rmse": float(best_eval_rmse),
         "training_time": training_time
     }
 
@@ -152,13 +181,16 @@ def generate_plots(all_histories, epochs, out_dir):
     plt.figure(figsize=(10, 6))
     for hl in [1, 2, 3]:
         key = f"hl{hl}_n64"
-        if key in all_histories:
-            data = np.array(all_histories[key])  # Shape: (5_seeds, epochs)
-            mean_rmse = np.mean(data, axis=0)
-            std_rmse = np.std(data, axis=0)
+        if key in all_histories and len(all_histories[key]) > 0:
+            try:
+                data = np.array(all_histories[key])  # Shape: (5_seeds, epochs)
+                mean_rmse = np.mean(data, axis=0)
+                std_rmse = np.std(data, axis=0)
 
-            plt.plot(epoch_axis, mean_rmse, label=f'{hl} Hidden Layers')
-            plt.fill_between(epoch_axis, mean_rmse - std_rmse, mean_rmse + std_rmse, alpha=0.2)
+                plt.plot(epoch_axis, mean_rmse, label=f'{hl} Hidden Layers')
+                plt.fill_between(epoch_axis, mean_rmse - std_rmse, mean_rmse + std_rmse, alpha=0.2)
+            except ValueError:
+                print(f"Skipping plot for {key} due to incomplete data arrays.")
 
     plt.title('Effect of Network Depth on Evaluation RMSE (64 Neurons/Layer)')
     plt.xlabel('Epoch')
@@ -172,13 +204,16 @@ def generate_plots(all_histories, epochs, out_dir):
     plt.figure(figsize=(10, 6))
     for n in [32, 64, 128, 256]:
         key = f"hl2_n{n}"
-        if key in all_histories:
-            data = np.array(all_histories[key])
-            mean_rmse = np.mean(data, axis=0)
-            std_rmse = np.std(data, axis=0)
+        if key in all_histories and len(all_histories[key]) > 0:
+            try:
+                data = np.array(all_histories[key])
+                mean_rmse = np.mean(data, axis=0)
+                std_rmse = np.std(data, axis=0)
 
-            plt.plot(epoch_axis, mean_rmse, label=f'{n} Neurons/Layer')
-            plt.fill_between(epoch_axis, mean_rmse - std_rmse, mean_rmse + std_rmse, alpha=0.2)
+                plt.plot(epoch_axis, mean_rmse, label=f'{n} Neurons/Layer')
+                plt.fill_between(epoch_axis, mean_rmse - std_rmse, mean_rmse + std_rmse, alpha=0.2)
+            except ValueError:
+                print(f"Skipping plot for {key} due to incomplete data arrays.")
 
     plt.title('Effect of Network Width on Evaluation RMSE (2 Hidden Layers)')
     plt.xlabel('Epoch')
