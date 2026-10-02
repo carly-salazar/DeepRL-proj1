@@ -87,10 +87,16 @@ def train_single_run(args, norm_data, label_mu, label_std, feat_mu, feat_std, ru
     set_seed(args.seed)
     device = torch.device(args.device)
 
-    train_dataset = TensorDataset(norm_data['training_features'], norm_data['training_labels'])
+    # 1. FIX: Move the entire normalized dataset to the GPU upfront
+    train_features = norm_data['training_features'].to(device)
+    train_labels = norm_data['training_labels'].to(device)
+    eval_features = norm_data['evaluation_features'].to(device)
+    eval_labels = norm_data['evaluation_labels'].to(device)
+
+    train_dataset = TensorDataset(train_features, train_labels)
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
 
-    eval_dataset = TensorDataset(norm_data['evaluation_features'], norm_data['evaluation_labels'])
+    eval_dataset = TensorDataset(eval_features, eval_labels)
     eval_loader = DataLoader(eval_dataset, batch_size=args.batch_size, shuffle=False)
 
     model = NeuralNetwork(14, 1, args.hidden_layers, args.neurons).to(device)
@@ -111,8 +117,7 @@ def train_single_run(args, norm_data, label_mu, label_std, feat_mu, feat_std, ru
         epoch_train_loss = 0.0
 
         for batch_features, batch_labels in train_loader:
-            batch_features, batch_labels = batch_features.to(device), batch_labels.to(device)
-
+            # Removed the .to(device) transfer lines since data is already on the GPU
             optimizer.zero_grad()
             outputs = model(batch_features)
             loss = criterion(outputs, batch_labels.view_as(outputs))
@@ -130,10 +135,10 @@ def train_single_run(args, norm_data, label_mu, label_std, feat_mu, feat_std, ru
 
         with torch.no_grad():
             for batch_features, batch_labels in eval_loader:
-                batch_features = batch_features.to(device)
                 preds = model(batch_features)
                 eval_preds_list.append(preds.cpu())
-                eval_labels_list.append(batch_labels)
+                # Ensure labels are also brought back to CPU for proper concatenation and math
+                eval_labels_list.append(batch_labels.cpu())
 
             eval_preds_norm = torch.cat(eval_preds_list)
             eval_labels_norm = torch.cat(eval_labels_list)
@@ -182,7 +187,12 @@ def train_single_run(args, norm_data, label_mu, label_std, feat_mu, feat_std, ru
 
 def evaluate_test_set(args, norm_data, label_mu, label_std):
     device = torch.device(args.device)
-    test_dataset = TensorDataset(norm_data['testing_features'], norm_data['testing_labels'])
+    
+    # 2. FIX: Move testing data to GPU upfront as well
+    test_features = norm_data['testing_features'].to(device)
+    test_labels = norm_data['testing_labels'].to(device)
+    
+    test_dataset = TensorDataset(test_features, test_labels)
     test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False)
 
     mse_list = []
@@ -207,10 +217,9 @@ def evaluate_test_set(args, norm_data, label_mu, label_std):
 
         with torch.no_grad():
             for batch_features, batch_labels in test_loader:
-                batch_features = batch_features.to(device)
                 preds = model(batch_features)
                 test_preds_list.append(preds.cpu())
-                test_labels_list.append(batch_labels)
+                test_labels_list.append(batch_labels.cpu())
 
         test_preds_norm = torch.cat(test_preds_list)
         test_labels_norm = torch.cat(test_labels_list)
