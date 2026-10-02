@@ -9,7 +9,6 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import matplotlib.pyplot as plt
-from torch.utils.data import TensorDataset, DataLoader
 
 
 class NeuralNetwork(nn.Module):
@@ -57,23 +56,19 @@ def load_and_prep_data(data_path, device, train_size=100000, quick_test=False):
     tensors = {k: torch.tensor(v, dtype=torch.float32) for k, v in data.items()}
 
     if quick_test:
-        # Quick test uses a tiny subset of data
         tensors['training_features'] = tensors['training_features'][:100]
         tensors['training_labels'] = tensors['training_labels'][:100]
         tensors['evaluation_features'] = tensors['evaluation_features'][:100]
         tensors['evaluation_labels'] = tensors['evaluation_labels'][:100]
     else:
-        # Subset training data based on --train-size argument
         tensors['training_features'] = tensors['training_features'][:train_size]
         tensors['training_labels'] = tensors['training_labels'][:train_size]
 
-    # Compute normalization statistics ONLY on the training subset
     feat_mu, feat_std = get_normalization_stats(tensors['training_features'])
     label_mu, label_std = get_normalization_stats(tensors['training_labels'])
 
     norm_data = {}
     for split in ['training', 'evaluation', 'testing']:
-        # The quick test doesn't necessarily need to process testing data, but we do it to avoid KeyErrors
         if quick_test and split == 'testing':
             continue
         
@@ -86,20 +81,29 @@ def load_and_prep_data(data_path, device, train_size=100000, quick_test=False):
 def train_single_run(args, norm_data, label_mu, label_std, feat_mu, feat_std, run_prefix=""):
     set_seed(args.seed)
     device = torch.device(args.device)
+    
+    # Move normalization stats to GPU
+    label_mu = label_mu.to(device)
+    label_std = label_std.to(device)
 
-    # 1. FIX: Move the entire normalized dataset to the GPU upfront
+    # Move ENTIRE datasets to GPU upfront
     train_features = norm_data['training_features'].to(device)
     train_labels = norm_data['training_labels'].to(device)
     eval_features = norm_data['evaluation_features'].to(device)
     eval_labels = norm_data['evaluation_labels'].to(device)
 
-    train_dataset = TensorDataset(train_features, train_labels)
-    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
-
-    eval_dataset = TensorDataset(eval_features, eval_labels)
-    eval_loader = DataLoader(eval_dataset, batch_size=args.batch_size, shuffle=False)
+    num_train_samples = train_features.size(0)
+    num_eval_samples = eval_features.size(0)
 
     model = NeuralNetwork(14, 1, args.hidden_layers, args.neurons).to(device)
+    
+    # Optional: compile the model to fuse GPU kernels if using PyTorch 2.0+
+    if hasattr(torch, "compile") and os.name != "nt":
+        try:
+            model = torch.compile(model)
+        except Exception:
+            pass # Gracefully fallback if compiler isn't supported in environment
+
     optimizer = optim.Adam(model.parameters(), lr=args.lr)
     criterion = nn.MSELoss()
 
@@ -108,56 +112,67 @@ def train_single_run(args, norm_data, label_mu, label_std, feat_mu, feat_std, ru
     best_model_state = None
     history = {'train_loss': [], 'eval_rmse': []}
 
-    if args.device == 'cuda':
+    # Extract single float scalar for standard deviation scaling
+    label_var = float(label_std.squeeze()) ** 2
+
+    if device.type == 'cuda':
         torch.cuda.synchronize()
     start_time = time.time()
 
     for epoch in range(args.epochs):
         model.train()
-        epoch_train_loss = 0.0
+        
+        epoch_train_loss = torch.tensor(0.0, device=device)
+        # 1. GPU-native batching: shuffle indices directly on the GPU
+        indices = torch.randperm(num_train_samples, device=device)
 
-        for batch_features, batch_labels in train_loader:
-            # Removed the .to(device) transfer lines since data is already on the GPU
-            optimizer.zero_grad()
+        for start_idx in range(0, num_train_samples, args.batch_size):
+            # 1. GPU-native slicing
+            batch_indices = indices[start_idx:start_idx + args.batch_size]
+            batch_features = train_features[batch_indices]
+            batch_labels = train_labels[batch_indices]
+
+            optimizer.zero_grad(set_to_none=True)
             outputs = model(batch_features)
             loss = criterion(outputs, batch_labels.view_as(outputs))
             loss.backward()
             optimizer.step()
             
-            epoch_train_loss += loss.item() * batch_features.size(0)
+            epoch_train_loss += loss.detach() * batch_features.size(0)
 
-        epoch_train_loss /= len(train_dataset)
-        history['train_loss'].append(epoch_train_loss)
+        # Sync loss to CPU once per epoch
+        epoch_train_loss_val = (epoch_train_loss / num_train_samples).item()
+        history['train_loss'].append(epoch_train_loss_val)
 
         model.eval()
-        eval_preds_list = []
-        eval_labels_list = []
+        epoch_eval_mse = torch.tensor(0.0, device=device)
 
         with torch.no_grad():
-            for batch_features, batch_labels in eval_loader:
+            for start_idx in range(0, num_eval_samples, args.batch_size):
+                batch_features = eval_features[start_idx:start_idx + args.batch_size]
+                batch_labels = eval_labels[start_idx:start_idx + args.batch_size]
+                
                 preds = model(batch_features)
-                eval_preds_list.append(preds.cpu())
-                # Ensure labels are also brought back to CPU for proper concatenation and math
-                eval_labels_list.append(batch_labels.cpu())
+                
+                # 2. Math bottleneck fix: Calculate MSE on NORMALIZED data directly
+                batch_mse = nn.functional.mse_loss(preds, batch_labels.view_as(preds))
+                epoch_eval_mse += batch_mse * batch_features.size(0)
 
-            eval_preds_norm = torch.cat(eval_preds_list)
-            eval_labels_norm = torch.cat(eval_labels_list)
+        # Sync eval loss to CPU once per epoch
+        eval_mse_val = (epoch_eval_mse / num_eval_samples).item()
+        
+        # 2. Math bottleneck fix: Unnormalize the scalar at the end
+        unnormalized_mse = eval_mse_val * label_var
+        eval_rmse = np.sqrt(unnormalized_mse)
+        history['eval_rmse'].append(eval_rmse)
 
-            # Unnormalize
-            eval_preds = eval_preds_norm * label_std + label_mu
-            eval_labels = eval_labels_norm * label_std + label_mu
+        if eval_rmse < best_eval_rmse:
+            best_eval_rmse = eval_rmse
+            best_epoch = epoch
+            # Clone model state dict natively on the GPU
+            best_model_state = {k: v.clone() for k, v in model.state_dict().items()}
 
-            # Calculate metrics
-            eval_mse = nn.functional.mse_loss(eval_preds, eval_labels.view_as(eval_preds)).item()
-            eval_rmse = np.sqrt(eval_mse)
-            history['eval_rmse'].append(eval_rmse)
-
-            if eval_rmse < best_eval_rmse:
-                best_eval_rmse = eval_rmse
-                best_epoch = epoch
-                best_model_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
-
-    if args.device == 'cuda':
+    if device.type == 'cuda':
         torch.cuda.synchronize()
     training_time = time.time() - start_time
 
@@ -188,12 +203,15 @@ def train_single_run(args, norm_data, label_mu, label_std, feat_mu, feat_std, ru
 def evaluate_test_set(args, norm_data, label_mu, label_std):
     device = torch.device(args.device)
     
-    # 2. FIX: Move testing data to GPU upfront as well
+    label_mu = label_mu.to(device)
+    label_std = label_std.to(device)
+
+    # Move ENTIRE test set to GPU upfront
     test_features = norm_data['testing_features'].to(device)
     test_labels = norm_data['testing_labels'].to(device)
-    
-    test_dataset = TensorDataset(test_features, test_labels)
-    test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False)
+    num_test_samples = test_features.size(0)
+
+    label_var = float(label_std.squeeze()) ** 2
 
     mse_list = []
     rmse_list = []
@@ -209,28 +227,26 @@ def evaluate_test_set(args, norm_data, label_mu, label_std):
             continue
 
         model = NeuralNetwork(14, 1, args.hidden_layers, args.neurons).to(device)
-        model.load_state_dict(torch.load(model_path))
+        model.load_state_dict(torch.load(model_path, map_location=device, weights_only=True))
         model.eval()
 
-        test_preds_list = []
-        test_labels_list = []
+        epoch_test_mse = torch.tensor(0.0, device=device)
 
         with torch.no_grad():
-            for batch_features, batch_labels in test_loader:
+            for start_idx in range(0, num_test_samples, args.batch_size):
+                batch_features = test_features[start_idx:start_idx + args.batch_size]
+                batch_labels = test_labels[start_idx:start_idx + args.batch_size]
+                
                 preds = model(batch_features)
-                test_preds_list.append(preds.cpu())
-                test_labels_list.append(batch_labels.cpu())
+                batch_mse = nn.functional.mse_loss(preds, batch_labels.view_as(preds))
+                epoch_test_mse += batch_mse * batch_features.size(0)
 
-        test_preds_norm = torch.cat(test_preds_list)
-        test_labels_norm = torch.cat(test_labels_list)
-
-        test_preds = test_preds_norm * label_std + label_mu
-        test_labels = test_labels_norm * label_std + label_mu
-
-        test_mse = nn.functional.mse_loss(test_preds, test_labels.view_as(test_preds)).item()
-        test_rmse = np.sqrt(test_mse)
+        # Unnormalize scalar
+        test_mse_val = (epoch_test_mse / num_test_samples).item()
+        unnormalized_mse = test_mse_val * label_var
+        test_rmse = np.sqrt(unnormalized_mse)
         
-        mse_list.append(test_mse)
+        mse_list.append(unnormalized_mse)
         rmse_list.append(test_rmse)
 
     if mse_list:
@@ -331,14 +347,9 @@ def run_gpu_sweep(args):
 
 
 def run_self_directed_sweep(args):
-    """
-    Self-Directed Investigation: Tests the impact of batch size on convergence speed and performance.
-    Baseline: Batch size 10000. New Condition: Batch size 1000.
-    """
     device = torch.device(args.device)
     norm_data, label_mu, label_std, feat_mu, feat_std = load_and_prep_data(args.data_path, device, args.train_size)
 
-    # Lock architecture to a baseline model
     args.hidden_layers = 2
     args.neurons = 64
     seeds = [0, 1, 2, 3, 4]
@@ -356,13 +367,11 @@ def run_self_directed_sweep(args):
             args.seed = seed
             print(f"Running Self-Directed: Batch Size {bs}, Seed {seed}...")
             
-            # Using a prefix to avoid overwriting baseline model checkpoint files
             _, eval_rmse_history = train_single_run(
                 args, norm_data, label_mu, label_std, feat_mu, feat_std, run_prefix=f"sd_bs{bs}_"
             )
             all_histories[config_key].append(eval_rmse_history)
 
-    # Plot self-directed results
     os.makedirs(os.path.join(args.out_dir, 'plots'), exist_ok=True)
     epoch_axis = np.arange(args.epochs)
     plt.figure(figsize=(10, 6))
@@ -390,7 +399,6 @@ def run_self_directed_sweep(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Swept Volume Neural Network Trainer")
     
-    # Core variables
     parser.add_argument("--data-path", type=str, default="swept_volume_data.npz")
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--batch-size", type=int, default=10000)
@@ -398,23 +406,19 @@ if __name__ == "__main__":
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--out-dir", type=str, default="runs")
     
-    # Missing parameters implemented:
-    parser.add_argument("--train-size", type=int, default=100000, help="Subset size of training data to use")
-    parser.add_argument("--quick-test", action="store_true", help="Run a fast execution to verify code validity without testing set")
-    parser.add_argument("--test-final", action="store_true", help="Evaluate a specific configuration's 5 seeds on the held-out testing set")
+    parser.add_argument("--train-size", type=int, default=100000)
+    parser.add_argument("--quick-test", action="store_true")
+    parser.add_argument("--test-final", action="store_true")
     
-    # Execution modes
-    parser.add_argument("--sweep", action="store_true", help="Run the full 60-configuration GPU sweep and plot results")
-    parser.add_argument("--self-directed", action="store_true", help="Run the self-directed empirical investigation comparing batch sizes")
+    parser.add_argument("--sweep", action="store_true")
+    parser.add_argument("--self-directed", action="store_true")
 
-    # Config for individual runs
     parser.add_argument("--hidden-layers", type=int, default=2)
     parser.add_argument("--neurons", type=int, default=64)
     parser.add_argument("--seed", type=int, default=0)
 
     args = parser.parse_args()
 
-    # 1. Quick Test Execution
     if args.quick_test:
         print("Running in --quick-test mode...")
         args.epochs = 2 
@@ -425,21 +429,17 @@ if __name__ == "__main__":
         print("Quick test complete. Exiting successfully.")
         exit(0)
 
-    # 2. Final Test Set Evaluation
     elif args.test_final:
         device = torch.device(args.device)
         norm_data, label_mu, label_std, feat_mu, feat_std = load_and_prep_data(args.data_path, device, args.train_size)
         evaluate_test_set(args, norm_data, label_mu, label_std)
 
-    # 3. Required GPU Sweep
     elif args.sweep:
         run_gpu_sweep(args)
 
-    # 4. Self-Directed Investigation
     elif args.self_directed:
         run_self_directed_sweep(args)
 
-    # 5. Default Individual Run
     else:
         device = torch.device(args.device)
         norm_data, label_mu, label_std, feat_mu, feat_std = load_and_prep_data(args.data_path, device, args.train_size)
